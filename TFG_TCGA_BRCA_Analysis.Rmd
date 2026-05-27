@@ -1,0 +1,1019 @@
+---
+title: "Análisis de Expresión Diferencial de Isoformas en TCGA-BRCA"
+subtitle: "Trabajo de Fin de Grado — Pipeline Bioinformático Completo"
+author: "Abdelfatah Oumouss Aitmoussa"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# =============================================================================
+# CONFIGURACIÓN GLOBAL DEL DOCUMENTO
+# =============================================================================
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+
+
+```{r librerias, message=FALSE, warning=FALSE}
+# =============================================================================
+# BLOQUE 0: CARGA DE LIBRERÍAS
+# =============================================================================
+# Instala automáticamente cualquier paquete que no esté disponible
+paquetes_necesarios <- c("ggplot2", "diptest", "readr", "ggrepel", "dplyr")
+
+for (pkg in paquetes_necesarios) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(ggplot2)    # Visualización
+library(diptest)    # Test de Hartigan (unimodalidad)
+library(ggrepel)    # Etiquetas sin solapamiento en ggplot2
+library(dplyr)      # Manipulación de datos (filter, arrange, etc.)
+```
+
+# Carga, Limpieza y División del Dataset
+
+## Carga del archivo de expresión (Firebrowse)
+
+```{r carga_datos}
+# =============================================================================
+# BLOQUE 1: CARGA DE DATOS BRUTOS
+# =============================================================================
+# El archivo de entrada es el .txt de isoformas de Firebrowse (TCGA-BRCA).
+# Se selecciona interactivamente; el flujo continúa de forma reproducible desde
+# los CSV intermedios si ya se han generado.
+
+message("Selecciona el archivo de EXPRESIÓN (.txt de Firebrowse)...")
+expr_path  <- file.choose()
+output_dir <- dirname(expr_path)   # Todos los outputs irán al mismo directorio
+
+# --- Carga con el formato original de Firebrowse ---
+expr <- read.table(
+  expr_path,
+  header          = TRUE,
+  sep             = "\t",
+  stringsAsFactors = FALSE,
+  check.names     = FALSE
+)
+
+# Estandarizar nombre de la columna de identificadores
+colnames(expr)[1] <- "isoform_id"
+
+# Eliminar la fila de cabecera redundante que incluye Firebrowse (fila 1)
+expr <- expr[-1, ]
+
+# Convertir todo excepto la columna de ID a numérico
+expr[, -1] <- apply(expr[, -1], 2, function(x) as.numeric(as.character(x)))
+```
+
+## Clasificación de muestras por código TCGA
+
+```{r clasificacion_muestras}
+# =============================================================================
+# BLOQUE 2: CLASIFICACIÓN TUMOR / NORMAL SEGÚN BARCODE TCGA
+# =============================================================================
+# Los dígitos 14-15 del barcode TCGA codifican el tipo de muestra:
+#   01-09  → Tumor primario
+#   10-19  → Tejido normal adyacente
+
+all_samples  <- colnames(expr)[-1]
+sample_types <- as.numeric(substr(all_samples, 14, 15))
+
+tumor_samples  <- all_samples[sample_types < 10]
+normal_samples <- all_samples[sample_types >= 10]
+
+cat("🔬 Muestras tumorales  :", length(tumor_samples),  "\n")
+cat("🧬 Muestras normales   :", length(normal_samples), "\n")
+
+# --- Crear sub-matrices ---
+expr_tumor  <- expr[, c("isoform_id", tumor_samples),  drop = FALSE]
+expr_normal <- expr[, c("isoform_id", normal_samples), drop = FALSE]
+
+# --- Guardar a disco ---
+write.csv(expr_tumor,  file.path(output_dir, "solo_tumores.csv"),  row.names = FALSE)
+write.csv(expr_normal, file.path(output_dir, "solo_normales.csv"), row.names = FALSE)
+
+cat("💾 Archivos 'solo_tumores.csv' y 'solo_normales.csv' guardados.\n")
+```
+
+---
+
+# Pareado Estricto de Pacientes
+
+```{r pareado}
+# =============================================================================
+# BLOQUE 3: PAREADO ESTRICTO TUMOR–NORMAL
+# =============================================================================
+# Se cargan los CSV intermedios para independizar este bloque del anterior.
+
+Normal         <- read.csv(file.path(output_dir, "solo_normales.csv"), header = TRUE)
+Primary_tumor  <- read.csv(file.path(output_dir, "solo_tumores.csv"),  header = TRUE)
+
+# 3.1  Eliminar sufijo de versión de los IDs de isoforma (p.ej. "uc001zws.1" → "uc001zws")
+Normal$isoform_id        <- sub("\\..*", "", Normal$isoform_id)
+Primary_tumor$isoform_id <- sub("\\..*", "", Primary_tumor$isoform_id)
+
+# 3.2  Transformación log2(x + 1) para estabilizar varianza
+cols_normal  <- setdiff(colnames(Normal),        "isoform_id")
+cols_primary <- setdiff(colnames(Primary_tumor), "isoform_id")
+
+Normal[, cols_normal]           <- log2(Normal[, cols_normal]           + 1)
+Primary_tumor[, cols_primary]   <- log2(Primary_tumor[, cols_primary]   + 1)
+
+# 3.3  Funciones auxiliares para parsear el barcode (formato TCGA en puntos)
+#      Ejemplo: TCGA.A1.A0SB.01A → paciente = TCGA.A1.A0SB, tipo = 01A
+extraer_paciente    <- function(x) sapply(strsplit(x, "\\."), function(z) paste(z[1:3], collapse = "."))
+extraer_tipo_muestra <- function(x) sapply(strsplit(x, "\\."), function(z) z[4])
+
+# 3.4  DataFrames de metadatos de muestra
+df_normal <- data.frame(
+  col      = cols_normal,
+  paciente = extraer_paciente(cols_normal),
+  tipo     = extraer_tipo_muestra(cols_normal)
+)
+df_tumor <- data.frame(
+  col      = cols_primary,
+  paciente = extraer_paciente(cols_primary),
+  tipo     = extraer_tipo_muestra(cols_primary)
+)
+
+# 3.5  Filtrar únicamente muestras válidas por tipo TCGA
+#      Normal adyacente: 11A / 11B  |  Tumor primario: 01A / 01B
+df_normal <- subset(df_normal, tipo %in% c("11A", "11B"))
+df_tumor  <- subset(df_tumor,  tipo %in% c("01A", "01B"))
+
+# 3.6  Identificar pacientes con AMBAS muestras (pareado estricto)
+pacientes_pareados <- intersect(df_normal$paciente, df_tumor$paciente)
+cat("🔍 Pacientes con par Tumor–Normal encontrados:", length(pacientes_pareados), "\n")
+
+# 3.7  Filtrar y desduplicar (un par por paciente)
+df_normal_p <- df_normal[df_normal$paciente %in% pacientes_pareados, ]
+df_tumor_p  <- df_tumor[ df_tumor$paciente  %in% pacientes_pareados, ]
+
+df_normal_p <- df_normal_p[!duplicated(df_normal_p$paciente), ]
+df_tumor_p  <- df_tumor_p[ !duplicated(df_tumor_p$paciente),  ]
+
+# 3.8  Ordenar por paciente para garantizar el alineamiento
+df_normal_p <- df_normal_p[order(df_normal_p$paciente), ]
+df_tumor_p  <- df_tumor_p[ order(df_tumor_p$paciente),  ]
+
+pacientes_final <- df_normal_p$paciente
+
+# 3.9  Construir matrices pareadas con nombre de columna = ID de paciente
+Normal_pareado <- Normal[,        c("isoform_id", df_normal_p$col)]
+Tumor_pareado  <- Primary_tumor[, c("isoform_id", df_tumor_p$col)]
+
+colnames(Normal_pareado)[-1] <- pacientes_final
+colnames(Tumor_pareado)[-1]  <- pacientes_final
+
+# 3.10 Verificación de alineamiento estricto (falla si hay discrepancia)
+stopifnot(all(colnames(Normal_pareado)[-1] == colnames(Tumor_pareado)[-1]))
+cat("✅ Pares definitivos confirmados:", length(pacientes_final), "\n")
+
+# 3.11 Guardar matrices pareadas
+write.csv(Normal_pareado, file.path(output_dir, "Normal_pareado.csv"),  row.names = FALSE)
+write.csv(Tumor_pareado,  file.path(output_dir, "Tumor_pareado.csv"),   row.names = FALSE)
+cat("💾 Matrices pareadas guardadas.\n")
+```
+
+---
+
+# Control de Calidad: PCA Antes y Después del Pareado
+
+```{r pca_utils}
+# =============================================================================
+# BLOQUE 4: FUNCIÓN AUXILIAR PARA PCA
+# =============================================================================
+# Factoriza la lógica para no repetir código en los dos PCA.
+
+run_pca <- function(mat_list, group_labels) {
+  # mat_list    : lista de matrices numéricas (muestras en columnas)
+  # group_labels: vector de etiquetas de grupo, mismo orden que las matrices
+  
+  combined <- do.call(cbind, mat_list)       # Unir todas las matrices
+  pca_mat  <- t(combined)                    # Muestras en filas → PCA
+  
+  # Eliminar features con varianza cero (evita división por cero en scale.)
+  pca_mat <- pca_mat[, apply(pca_mat, 2, var, na.rm = TRUE) > 0]
+  
+  res <- prcomp(pca_mat, scale. = TRUE)
+  
+  var_exp <- round(summary(res)$importance[2, 1:2] * 100, 1)
+  
+  df_plot <- data.frame(
+    PC1  = res$x[, 1],
+    PC2  = res$x[, 2],
+    Tipo = group_labels
+  )
+  list(df = df_plot, var_exp = var_exp)
+}
+```
+
+## PCA previo al pareado
+
+```{r pca_pre}
+# =============================================================================
+# BLOQUE 5: PCA PREVIO AL PAREADO (control de calidad inicial)
+# =============================================================================
+# Utiliza TODAS las muestras antes de cualquier filtrado.
+
+comunes_pre <- intersect(Normal$isoform_id, Primary_tumor$isoform_id)
+mat_normal_pre <- Normal[Normal$isoform_id %in% comunes_pre, cols_normal]
+mat_tumor_pre  <- Primary_tumor[Primary_tumor$isoform_id %in% comunes_pre, cols_primary]
+
+grupos_pre <- c(
+  rep("Normal",  length(cols_normal)),
+  rep("Tumor",   length(cols_primary))
+)
+
+pca_pre <- run_pca(list(mat_normal_pre, mat_tumor_pre), grupos_pre)
+
+p_pca_pre <- ggplot(pca_pre$df, aes(PC1, PC2, color = Tipo)) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  scale_color_manual(values = c("Normal" = "#2196F3", "Tumor" = "#F44336")) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title    = "PCA — Previo al Pareado",
+    subtitle = paste0("Todas las muestras (N=", nrow(pca_pre$df), ")"),
+    x        = paste0("PC1 (", pca_pre$var_exp[1], "% varianza)"),
+    y        = paste0("PC2 (", pca_pre$var_exp[2], "% varianza)"),
+    color    = "Tipo de muestra"
+  )
+
+print(p_pca_pre)
+```
+
+## PCA post-pareado
+
+```{r pca_post}
+# =============================================================================
+# BLOQUE 6: PCA POST-PAREADO (con líneas que conectan cada par)
+# =============================================================================
+# Muestra cómo el pareado reduce el ruido inter-paciente.
+
+n_par <- length(pacientes_final)
+grupos_post <- c(rep("Normal (pareado)", n_par), rep("Tumor (pareado)", n_par))
+
+pca_post <- run_pca(
+  list(Normal_pareado[, -1], Tumor_pareado[, -1]),
+  grupos_post
+)
+
+# Añadir ID de paciente para dibujar las líneas de conexión
+pca_post$df$Paciente <- rep(pacientes_final, 2)
+
+p_pca_post <- ggplot(pca_post$df, aes(PC1, PC2, color = Tipo)) +
+  geom_line(aes(group = Paciente), color = "grey80", linewidth = 0.4, alpha = 0.6) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = c("Normal (pareado)" = "#2196F3", "Tumor (pareado)" = "#F44336")) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title    = "PCA — Post Pareado",
+    subtitle = paste0("Pares Tumor–Normal (N=", n_par, " pacientes)"),
+    x        = paste0("PC1 (", pca_post$var_exp[1], "% varianza)"),
+    y        = paste0("PC2 (", pca_post$var_exp[2], "% varianza)"),
+    color    = "Tipo de muestra"
+  )
+
+print(p_pca_post)
+```
+
+# Análisis de Expresión Diferencial Global Pareada (DEA)
+
+```{r dea_matriz}
+# =============================================================================
+# BLOQUE 7: CONSTRUCCIÓN DE LA MATRIZ DE EXPRESIÓN DIFERENCIAL PAREADA
+# =============================================================================
+# Para cada isoforma y cada paciente, calculamos: ΔExpr = log2(Tumor) − log2(Normal)
+# Como ya transformamos con log2(x+1), la diferencia es directamente log2FC pareado.
+
+common_ids <- intersect(Normal_pareado$isoform_id, Tumor_pareado$isoform_id)
+
+Normal_p <- Normal_pareado[Normal_pareado$isoform_id %in% common_ids, ]
+Tumor_p  <- Tumor_pareado[ Tumor_pareado$isoform_id  %in% common_ids, ]
+
+# Ordenar por isoforma para alinear filas correctamente
+Normal_p <- Normal_p[order(Normal_p$isoform_id), ]
+Tumor_p  <- Tumor_p[ order(Tumor_p$isoform_id),  ]
+
+# La diferencia columna a columna ya es el log2FC por paciente
+Expr_diff <- Tumor_p
+Expr_diff[, -1] <- Tumor_p[, -1] - Normal_p[, -1]
+
+cat("📊 Matriz de expresión diferencial:", nrow(Expr_diff), "isoformas ×",
+    ncol(Expr_diff) - 1, "pacientes.\n")
+```
+
+# Test Edastidistico Pareado
+
+```{r dea_test}
+# =============================================================================
+# BLOQUE 8: TEST ESTADÍSTICO PAREADO (t-test de una muestra vs. cero)
+# =============================================================================
+# H0: log2FC medio = 0 (sin cambio entre Tumor y Normal)
+# Se aplica corrección BH (FDR) para controlar la tasa de falsos positivos.
+# Umbrales definidos:
+#   - Downregulado : log2FC < -0.600  (≈ 40% de inhibición)
+#   - Upregulado   : log2FC >  0.485  (≈ 40% de sobreexpresión, log2(1.4))
+
+UMBRAL_DOWN <- -0.600
+UMBRAL_UP   <-  0.485
+UMBRAL_FDR  <-  0.05
+
+ids_globales <- Expr_diff$isoform_id
+n_iso        <- length(ids_globales)
+p_valores    <- numeric(n_iso)
+log2FC_med   <- numeric(n_iso)
+
+cat("🧪 Ejecutando DEA Global sobre", n_iso, "isoformas...\n")
+
+for (i in seq_len(n_iso)) {
+  vals <- as.numeric(Expr_diff[i, -1])
+  
+  log2FC_med[i] <- mean(vals, na.rm = TRUE)
+  
+  # t.test de una muestra: ¿la media es distinta de 0?
+  # Se envuelve en tryCatch para gestionar casos con varianza cero o NA
+  p_valores[i] <- tryCatch({
+    res <- t.test(vals[!is.na(vals)])
+    res$p.value
+  }, error = function(e) NA_real_)
+}
+
+# --- Tabla de resultados y corrección FDR (Benjamini-Hochberg) ---
+df_dea <- data.frame(
+  isoform_id = ids_globales,
+  log2FC     = log2FC_med,
+  p_value    = p_valores,
+  stringsAsFactors = FALSE
+)
+
+df_dea$fdr <- p.adjust(df_dea$p_value, method = "BH")
+
+# --- Clasificación según umbrales ---
+df_dea$status <- "No significativo"
+df_dea$status[df_dea$fdr < UMBRAL_FDR & df_dea$log2FC <= UMBRAL_DOWN] <- "Downregulado"
+df_dea$status[df_dea$fdr < UMBRAL_FDR & df_dea$log2FC >= UMBRAL_UP]   <- "Upregulado"
+
+n_down <- sum(df_dea$status == "Downregulado")
+n_up   <- sum(df_dea$status == "Upregulado")
+n_ns   <- sum(df_dea$status == "No significativo")
+
+cat("\n----------------------------------------------------------\n")
+cat("📊 RESULTADOS DEA GLOBAL (TCGA-BRCA, Tumor vs. Normal Pareado):\n")
+cat(sprintf("   Isoformas downreguladas (FDR<0.05, log2FC≤-0.6): %d\n", n_down))
+cat(sprintf("   Isoformas upreguladas   (FDR<0.05, log2FC≥0.485): %d\n", n_up))
+cat(sprintf("   No significativas                                : %d\n", n_ns))
+cat("----------------------------------------------------------\n")
+
+# Guardar tabla completa
+write.csv(df_dea, file.path(output_dir, "DEA_global_BRCA.csv"), row.names = FALSE)
+```
+
+
+# Selección y Justificación de Candidatos
+
+```{r ranking_candidatos}
+# =============================================================================
+# BLOQUE 9: RANKING Y LOCALIZACIÓN AUTOMÁTICA DE GENES CANDIDATOS
+# =============================================================================
+# Generamos un ranking de todas las isoformas significativas ordenadas por FDR.
+# Luego buscamos automáticamente los genes de interés y extraemos sus métricas.
+
+# 9.1  Ranking: solo isoformas con cambio significativo, ordenadas por FDR
+df_sig <- df_dea[df_dea$status != "No significativo", ]
+df_sig <- df_sig[order(df_sig$fdr), ]
+df_sig$rank <- seq_len(nrow(df_sig))
+
+cat("🏆 Total de isoformas significativas en el ranking:", nrow(df_sig), "\n\n")
+cat("TOP 20 isoformas más significativas:\n")
+print(head(df_sig[, c("rank", "isoform_id", "log2FC", "fdr", "status")], 20))
+
+write.csv(df_sig, file.path(output_dir, "ranking_DEA_significativas.csv"), row.names = FALSE)
+cat("\n💾 Ranking completo guardado en 'ranking_DEA_significativas.csv'.\n")
+
+# 9.2  Búsqueda de genes candidatos
+# DUT   → uc001zws (p01) y uc001zww (p02)
+# PDE2A → uc001oso, uc001osn, uc010dbj
+# IGF2BP1 → uc002iom
+genes_candidatos <- c(
+  "uc001zws",  # DUT isoforma p01
+  "uc001zww",  # DUT isoforma p02
+  "uc001oso",  # PDE2A
+  "uc001osn",  # PDE2A
+  "uc010dbj",  # IGF2BP1
+  "uc002iom"   # IGF2BP1
+)
+
+# Buscar en el ranking completo (incluyendo no significativos, para mostrar
+# su estado real si alguno no cumple los umbrales)
+df_candidatos <- df_dea[df_dea$isoform_id %in% genes_candidatos, ]
+df_candidatos <- df_candidatos[order(df_candidatos$fdr), ]
+
+# Añadir posición en el ranking de significativos (NA si no está)
+df_candidatos$rank_global <- match(df_candidatos$isoform_id, df_sig$isoform_id)
+
+cat("\n==========================================================\n")
+cat("✅ JUSTIFICACIÓN ESTADÍSTICA DE LOS GENES CANDIDATOS:\n")
+cat("==========================================================\n")
+
+for (i in seq_len(nrow(df_candidatos))) {
+  fila <- df_candidatos[i, ]
+  cat(sprintf(
+    "  %-12s | log2FC = %+.4f | FDR = %.2e | Estado: %-18s | Posición ranking: %s\n",
+    fila$isoform_id,
+    fila$log2FC,
+    fila$fdr,
+    fila$status,
+    ifelse(is.na(fila$rank_global), "No significativo", fila$rank_global)
+  ))
+}
+cat("==========================================================\n")
+
+write.csv(df_candidatos, file.path(output_dir, "justificacion_candidatos.csv"), row.names = FALSE)
+```
+
+## Volcano Plot Global
+
+```{r volcano_global}
+# =============================================================================
+# BLOQUE 10: VOLCANO PLOT GLOBAL DEA (Tumor vs. Normal Pareado)
+# =============================================================================
+# Se etiquetan automáticamente los genes candidatos en el gráfico.
+
+# Columna auxiliar para saber si una isoforma es candidata
+df_dea$etiqueta <- ifelse(df_dea$isoform_id %in% genes_candidatos, df_dea$isoform_id, NA)
+
+p_volcano <- ggplot(df_dea, aes(x = log2FC, y = -log10(fdr), color = status)) +
+  geom_point(alpha = 0.35, size = 0.9) +
+  scale_color_manual(
+    values = c(
+      "Downregulado"    = "#2166AC",
+      "Upregulado"      = "#D6604D",
+      "No significativo" = "grey70"
+    ),
+    name = "Expresión diferencial"
+  ) +
+  # Líneas de umbral
+  geom_vline(xintercept = c(UMBRAL_DOWN, UMBRAL_UP),
+             linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(UMBRAL_FDR),
+             linetype = "dashed", color = "black", linewidth = 0.5) +
+  # Etiquetas de candidatos con ggrepel para evitar solapamiento
+  geom_label_repel(
+    data = df_dea[!is.na(df_dea$etiqueta), ],
+    aes(label = etiqueta),
+    size         = 3.2,
+    fontface     = "bold",
+    box.padding  = 0.5,
+    max.overlaps = 20,
+    color        = "black",
+    fill         = "white",
+    segment.color = "grey40"
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title    = "Volcano Plot — DEA Global TCGA-BRCA (Tumor vs. Normal Pareado)",
+    subtitle = sprintf("Down: %d  |  Up: %d  |  FDR < 0.05; log2FC umbrales: -0.6 / +0.485",
+                       n_down, n_up),
+    x        = "log2 Fold Change (Tumor − Normal)",
+    y        = "−log10 FDR"
+  ) +
+  theme(legend.position = "right")
+
+print(p_volcano)
+```
+
+## Análisis Detallado de Candidatos (K-means / Terciles)
+
+```{r candidatos_setup}
+# =============================================================================
+# BLOQUE 11: DEFINICIÓN DE CANDIDATOS PARA ANÁLISIS DETALLADO
+# =============================================================================
+# Lista de isoformas a analizar individualmente con sus nombres descriptivos.
+
+isoformas_estudio <- list(
+  DUT_1  = "uc001zws",
+  DUT_2  = "uc001zww",
+  PDE2A_1  = "uc001oso",
+  PDE2A_2  = "uc001osn",
+  IGF2BP1_1  = "uc010dbj",
+  IGF2BP1_2  = "uc002iom"
+)
+
+# DataFrame acumulador para el volcano del análisis por grupos
+resultados_grupos_acum <- data.frame()
+
+# DataFrame para el histograma de todas las isoformas candidatas
+histograma_datos_acum  <- data.frame()
+
+cat("📋 Candidatos a analizar:", paste(names(isoformas_estudio), collapse = ", "), "\n")
+```
+
+## Realización de los Histogramas
+
+```{r analisis_por_candidato}
+# =============================================================================
+# BLOQUE 12: BUCLE PRINCIPAL — ANÁLISIS DETALLADO POR ISOFORMA CANDIDATA
+# =============================================================================
+
+for (nombre_iso in names(isoformas_estudio)) {
+  
+  transcript_id <- isoformas_estudio[[nombre_iso]]
+  cat("\n", strrep("─", 60), "\n")
+  cat("🔎 Analizando:", nombre_iso, "(", transcript_id, ")\n")
+  
+  # -----------------------------------------------------------------
+  # 12.1  Extraer el vector log2FC de todos los pacientes
+  # -----------------------------------------------------------------
+  fila_expr <- Expr_diff[Expr_diff$isoform_id == transcript_id, ]
+  
+  if (nrow(fila_expr) == 0) {
+    cat("⚠️  Isoforma no encontrada en la matriz diferencial. Se omite.\n")
+    next
+  }
+  
+  valores_log2FC      <- as.numeric(fila_expr[1, -1])
+  nombres_pacientes   <- colnames(fila_expr)[-1]
+  names(valores_log2FC) <- nombres_pacientes
+  
+  # Eliminar NAs
+  valores_log2FC <- valores_log2FC[!is.na(valores_log2FC)]
+  
+  if (length(valores_log2FC) < 10) {
+    cat("⚠️  Menos de 10 valores válidos. Se omite.\n")
+    next
+  }
+  
+  # Acumular datos para el histograma global
+  histograma_datos_acum <- rbind(
+    histograma_datos_acum,
+    data.frame(
+      paciente      = names(valores_log2FC),
+      log2FC        = valores_log2FC,
+      isoforma      = nombre_iso,
+      transcript_id = transcript_id
+    )
+  )
+  
+  # -----------------------------------------------------------------
+  # 12.2  Histograma de distribución del log2FC
+  # -----------------------------------------------------------------
+  nombre_hist <- paste0("Histograma_log2FC_", nombre_iso, "_", transcript_id, ".tiff")
+  
+  tiff(
+    file.path(output_dir, nombre_hist),
+    width = 1600, height = 1200, res = 300, compression = "lzw"
+  )
+  rango_local <- max(abs(range(valores_log2FC, na.rm = TRUE)))
+  hist(
+    valores_log2FC, 
+    breaks = seq(-rango_local, rango_local, length.out = 31),
+    col    = "lightsteelblue", border = "white",
+    main   = paste0("Distribución log2FC pareado — ", nombre_iso, " (", transcript_id, ")"),
+    xlab   = "log2FC (Tumor − Normal)",
+    ylab   = "Frecuencia",
+    prob   = TRUE,
+    xlim   = c(-rango_local, rango_local)
+  )
+  lines(density(valores_log2FC, na.rm = TRUE), col = "navy", lwd = 2)
+  abline(v = 0, col = "red", lty = 2, lwd = 2)
+  legend("topright",
+         legend = c("Densidad", paste0("Media = ", round(mean(valores_log2FC), 3))),
+         col = c("navy", "transparent"), lty = c(1, 0), lwd = 2, bty = "n")
+  dev.off()
+  cat("💾 Histograma guardado:", nombre_hist, "\n")
+  
+  # -----------------------------------------------------------------
+  # 12.3  Test de Hartigan (dip.test) para detectar multimodalidad
+  # -----------------------------------------------------------------
+  p_dip <- dip.test(valores_log2FC)$p.value
+  cat(sprintf("   dip.test p-valor = %.4f → ", p_dip))
+  
+  if (p_dip < 0.05) {
+    # ---- DISTRIBUCIÓN MULTIMODAL: K-means (k=2) ----
+    cat("Distribución MULTIMODAL → K-means (k=2)\n")
+    set.seed(42)   # Reproducibilidad
+    km <- kmeans(valores_log2FC, centers = 2, nstart = 25)
+    
+    # El cluster con mayor centroide = grupo alto
+    cluster_alto <- which.max(km$centers)
+    cluster_bajo <- which.min(km$centers)
+    
+    grupo_alto <- names(valores_log2FC)[km$cluster == cluster_alto]
+    grupo_bajo <- names(valores_log2FC)[km$cluster == cluster_bajo]
+    
+  } else {
+    # ---- DISTRIBUCIÓN UNIMODAL: Terciles ----
+    cat("Distribución UNIMODAL → Terciles\n")
+    terciles   <- quantile(valores_log2FC, probs = c(1/3, 2/3), na.rm = TRUE)
+    grupo_bajo <- names(valores_log2FC[valores_log2FC <= terciles[1]])
+    grupo_alto <- names(valores_log2FC[valores_log2FC >= terciles[2]])
+  }
+  
+  cat(sprintf("   Grupo Alto: %d pacientes | Grupo Bajo: %d pacientes\n",
+              length(grupo_alto), length(grupo_bajo)))
+  
+  if (length(grupo_alto) < 3 || length(grupo_bajo) < 3) {
+    cat("⚠️  Grupos insuficientes para análisis estadístico (mínimo 3). Se omite.\n")
+    next
+  }
+  
+  # -----------------------------------------------------------------
+  # 12.4  Diferencial entre grupos (Alto vs Bajo) para TODAS las isoformas
+  # -----------------------------------------------------------------
+  genes_iter  <- Expr_diff$isoform_id
+  n_genes     <- length(genes_iter)
+  log2FC_iter <- numeric(n_genes)
+  pval_iter   <- numeric(n_genes)
+  
+  for (j in seq_len(n_genes)) {
+    expr_alto <- as.numeric(Expr_diff[j, grupo_alto])
+    expr_bajo <- as.numeric(Expr_diff[j, grupo_bajo])
+    
+    # Descartar isoformas sin varianza en alguno de los grupos
+    if (var(expr_alto, na.rm = TRUE) == 0 || var(expr_bajo, na.rm = TRUE) == 0) {
+      log2FC_iter[j] <- NA
+      pval_iter[j]   <- NA
+      next
+    }
+    
+    ttest_res <- tryCatch(
+      t.test(expr_alto, expr_bajo),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(ttest_res)) {
+      log2FC_iter[j] <- mean(expr_alto, na.rm = TRUE) - mean(expr_bajo, na.rm = TRUE)
+      pval_iter[j]   <- ttest_res$p.value
+    } else {
+      log2FC_iter[j] <- NA
+      pval_iter[j]   <- NA
+    }
+  }
+  
+  # Tabla de resultados de esta iteración
+  res_iter <- data.frame(
+    transcript_id = genes_iter,
+    log2FC        = log2FC_iter,
+    p_value       = pval_iter,
+    fdr           = p.adjust(pval_iter, method = "BH"),
+    comparacion   = nombre_iso,
+    stringsAsFactors = FALSE
+  )
+  
+  resultados_grupos_acum <- rbind(resultados_grupos_acum, res_iter)
+  
+  # Guardar CSV de esta isoforma
+  nombre_csv <- paste0("diferencial_grupos_", nombre_iso, "_", transcript_id, ".csv")
+  write.csv(res_iter, file.path(output_dir, nombre_csv), row.names = FALSE)
+  
+  # Guardar info de asignación de grupos
+  split_df <- data.frame(
+    paciente = c(grupo_alto, grupo_bajo),
+    grupo    = c(rep("Alto", length(grupo_alto)), rep("Bajo", length(grupo_bajo)))
+  )
+  write.csv(split_df,
+            file.path(output_dir, paste0("grupos_", nombre_iso, ".csv")),
+            row.names = FALSE)
+  
+  cat(sprintf("   💾 Resultados guardados: %s\n", nombre_csv))
+}
+
+cat("\n✅ Análisis por candidatos completado.\n")
+```
+
+```{r guardar_histograma_acum}
+# =============================================================================
+# BLOQUE 13: GUARDAR DATOS ACUMULADOS DE HISTOGRAMAS
+# =============================================================================
+if (nrow(histograma_datos_acum) > 0) {
+  write.csv(histograma_datos_acum,
+            file.path(output_dir, "log2FC_pareado_candidatos_todos.csv"),
+            row.names = FALSE)
+  cat("💾 Datos de histogramas acumulados guardados.\n")
+}
+```
+
+---
+
+# Switching de isoformas
+
+## Scatter-Plot 
+
+```{r scatter_dut}
+# =============================================================================
+# BLOQUE 14: SCATTER PLOT — CORRELACIÓN ENTRE ISOFORMAS DUT (p01 vs p02)
+# =============================================================================
+
+iso_a <- "uc001zws"   # DUT p01
+iso_b <- "uc001zww"   # DUT p02
+
+fila_a <- Tumor_pareado[Tumor_pareado$isoform_id == iso_a, -1]
+fila_b <- Tumor_pareado[Tumor_pareado$isoform_id == iso_b, -1]
+
+if (nrow(fila_a) == 0 || nrow(fila_b) == 0) {
+  cat("⚠️  Una o ambas isoformas DUT no encontradas en Tumor_pareado. Se omite scatter.\n")
+} else {
+  
+  df_scatter <- data.frame(
+    p01 = as.numeric(fila_a),
+    p02 = as.numeric(fila_b)
+  )
+  df_scatter <- na.omit(df_scatter)
+  
+  cor_val <- cor(df_scatter$p01, df_scatter$p02, method = "pearson")
+  
+  p_scatter <- ggplot(df_scatter, aes(x = p01, y = p02)) +
+    geom_point(color = "darkred", alpha = 0.55, size = 2) +
+    geom_smooth(method = "lm", color = "black", se = TRUE, linewidth = 0.8) +
+    annotate("text", x = min(df_scatter$p01, na.rm = TRUE),
+             y = max(df_scatter$p02, na.rm = TRUE),
+             label = paste0("R = ", round(cor_val, 3)),
+             hjust = 0, size = 4.5, fontface = "bold") +
+    theme_minimal(base_size = 12) +
+    labs(
+      title    = "Correlación de Expresión en Tumores — Isoformas DUT",
+      subtitle = "uc001zws (p01) vs. uc001zww (p02)",
+      x        = "Expresión log2(p01) — uc001zws",
+      y        = "Expresión log2(p02) — uc001zww",
+      caption  = paste0("Pearson r = ", round(cor_val, 3))
+    )
+  
+  print(p_scatter)
+}
+```
+
+## Violin-Plot
+
+```{r violin_dut}
+# =============================================================================
+# BLOQUE 15: VIOLIN PLOT — BALANCE DE ISOFORMAS DUT (% p01 y % p02)
+# =============================================================================
+# Calcula el porcentaje de contribución de cada isoforma al total del gen DUT.
+
+fila_a_n <- Normal_pareado[Normal_pareado$isoform_id == iso_a, -1]
+fila_b_n <- Normal_pareado[Normal_pareado$isoform_id == iso_b, -1]
+fila_a_t <- Tumor_pareado[ Tumor_pareado$isoform_id  == iso_a, -1]
+fila_b_t <- Tumor_pareado[ Tumor_pareado$isoform_id  == iso_b, -1]
+
+if (nrow(fila_a_n) == 0 || nrow(fila_b_n) == 0) {
+  cat("⚠️  Isoformas DUT no encontradas para violin plot. Se omite.\n")
+} else {
+  
+  total_normal <- as.numeric(fila_a_n) + as.numeric(fila_b_n)
+  total_tumor  <- as.numeric(fila_a_t) + as.numeric(fila_b_t)
+  
+  # Evitar división por cero
+  total_normal[total_normal == 0] <- NA
+  total_tumor[ total_tumor  == 0] <- NA
+  
+  prop_a_n <- as.numeric(fila_a_n) / total_normal * 100
+  prop_a_t <- as.numeric(fila_a_t) / total_tumor  * 100
+  prop_b_n <- as.numeric(fila_b_n) / total_normal * 100
+  prop_b_t <- as.numeric(fila_b_t) / total_tumor  * 100
+  
+  df_violin <- data.frame(
+    Porcentaje = c(prop_a_n, prop_a_t, prop_b_n, prop_b_t),
+    Isoforma   = c(rep("uc001zws (p01)", length(prop_a_n) + length(prop_a_t)),
+                   rep("uc001zww (p02)", length(prop_b_n) + length(prop_b_t))),
+    Condicion  = c(
+      rep("Normal", length(prop_a_n)), rep("Tumor", length(prop_a_t)),
+      rep("Normal", length(prop_b_n)), rep("Tumor", length(prop_b_t))
+    )
+  )
+  df_violin <- na.omit(df_violin)
+  
+  p_violin <- ggplot(df_violin, aes(x = Condicion, y = Porcentaje, fill = Condicion)) +
+    facet_wrap(~Isoforma) +
+    geom_violin(alpha = 0.65, trim = FALSE) +
+    geom_boxplot(width = 0.12, outlier.size = 0.8) +
+    scale_fill_manual(values = c("Normal" = "#2196F3", "Tumor" = "#F44336")) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "Balance de Isoformas DUT en Tumores vs. Tejido Normal",
+      y     = "Contribución al total del gen DUT (%)",
+      x     = NULL,
+      fill  = "Condición"
+    )
+  
+  print(p_violin)
+}
+```
+
+# Arquitectura de las isoformas DUT
+
+```{r gviz_dut_final, fig.width=17, fig.height=4, fig.align='center'}
+
+library(Gviz)
+library(GenomicFeatures)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+# 1. Preparar los datos (Asegúrate de tener el txdb y las isoformas)
+isoformas_estudio <- c("uc001zws.3", "uc001zww.3")
+
+# Extraemos los exones y filtramos
+exones_list <- exonsBy(txdb, by = "tx", use.names = TRUE)
+exones_filtrados <- exones_list[names(exones_list) %in% isoformas_estudio]
+
+# 2. Creamos el Track de los Genes (Isoformas)
+# Gviz necesita un GRanges donde el 'transcript' esté bien definido
+gr_exones <- unlist(exones_filtrados)
+gr_exones$transcript <- names(gr_exones)
+gr_exones$gene <- names(gr_exones) # Para que las agrupe por nombre
+gr_exones$symbol <- names(gr_exones)
+
+# 3. Configuramos los colores
+# Gviz usa nombres de lista para asignar colores a cada grupo
+colores_isoformas <- c("uc001zws.3" = "#3498db", "uc001zww.3" = "#e74c3c")
+
+# 4. Construimos las pistas (Tracks)
+# Pista de los ejes (Coordenadas genómicas)
+track_eje <- GenomeAxisTrack()
+
+# Pista de las isoformas
+track_isoformas <- GeneRegionTrack(gr_exones, 
+                                   genome = "hg19", 
+                                   chromosome = as.character(seqnames(gr_exones)[1]),
+                                   name = "DUT isoformas",
+                                   transcriptAnnotation = "simbolo",
+                                   stacking = "squish",
+                                   stackHeight = 0.5,
+                                   background.title = "darkgray")
+
+# 5. Aplicamos los colores individualmente
+# Gviz requiere que asignemos el color por cada elemento
+feature(track_isoformas) <- names(gr_exones)
+
+# 6. Dibujamos
+plotTracks(list(track_eje, track_isoformas),
+           from = min(start(gr_exones)) - 1000,
+           to = max(end(gr_exones)) + 1000,
+           margin = 5,              
+           innerMargin = 0,
+           uc001zws.3 = "#3498db", 
+           uc001zww.3 = "#e74c3c",
+           col= "transparent",
+           lwd= 0,
+           cex.axis= 1,
+           cex.group= 1,
+           main = "Arquitectura de Isoformas DUT",
+           cex.main = 1.2)
+```
+
+# Análisis de supervivencia Kaplan-Meier 
+
+``` {r kaplan-meier , fig.width=12, fig.height=8, fig.align='center'}
+
+paquetes_surv <- c("survival", "survminer")
+library(survival)
+library(survminer)
+
+clinico_raw <- read.csv(
+  "BRCA.merged_only_clinical_clin_format.txt",
+  header          = FALSE,
+  sep             = "\t",             # <-- Aquí defines el tabulador
+  stringsAsFactors = FALSE,
+  check.names     = FALSE             # Evita que R cambie los guiones por puntos al leer columnas
+)
+
+nombres_filas_limpios <- trimws(tolower(as.character(clinico_raw[, 1])))
+
+# 3. Localizamos de forma ultra-flexible las posiciones de las variables críticas
+idx_barcodes <- grep("bcr_patient_barcode", nombres_filas_limpios)[1]
+idx_death    <- grep("days_to_death", nombres_filas_limpios)[1]
+idx_last     <- grep("days_to_last_followup", nombres_filas_limpios)[1]
+idx_status   <- grep("vital_status", nombres_filas_limpios)[1]
+
+# Si el barcode clásico fallara en alguna versión de Firebrowse, usamos el uuid como salvavidas
+if (is.na(idx_barcodes)) {
+  idx_barcodes <- grep("bcr_patient_uuid", nombres_filas_limpios)[1]
+}
+
+# Validación final de seguridad antes de procesar vectores
+if (is.na(idx_barcodes)) {
+  stop("❌ Error crítico: No se ha detectado la fila de identificadores de pacientes en el archivo clínico.")
+}
+
+# 4. Extraemos los vectores de datos omitiendo la primera columna descriptiva
+barcodes_pacientes <- toupper(trimws(as.character(clinico_raw[idx_barcodes, -1])))
+num_pacientes      <- length(barcodes_pacientes)
+
+vec_death  <- if(!is.na(idx_death))  as.numeric(clinico_raw[idx_death, -1])  else rep(NA, num_pacientes)
+vec_last   <- if(!is.na(idx_last))   as.numeric(clinico_raw[idx_last, -1])   else rep(NA, num_pacientes)
+vec_status <- if(!is.na(idx_status)) tolower(trimws(as.character(clinico_raw[idx_status, -1]))) else rep(NA, num_pacientes)
+
+# 5. Construimos la tabla clínica limpia inicial
+df_clinico <- data.frame(
+  paciente      = barcodes_pacientes,
+  days_to_death = vec_death,
+  days_to_last  = vec_last,
+  vital_status  = vec_status,
+  stringsAsFactors = FALSE
+)
+
+# 6. Estandarizar los códigos de barra (barcodes) de TCGA para el cruce de datos
+# Cambiamos guiones por puntos (ej. TCGA-A1-A0SB -> TCGA.A1.A0SB)
+df_clinico$paciente <- gsub("-", ".", df_clinico$paciente)
+
+# Recortamos el código a los 3 primeros componentes (ej. de TCGA.A1.A0SB.01A a TCGA.A1.A0SB)
+# Esto garantiza que encaje perfectamente con tu vector 'pacientes_final' del Bloque 3
+df_clinico$paciente <- sapply(strsplit(df_clinico$paciente, "\\."), function(z) paste(z[1:3], collapse = "."))
+
+# Unificamos el tiempo de seguimiento y el estado vital para el modelo matemático de Kaplan-Meier
+df_clinico$time   <- ifelse(!is.na(df_clinico$days_to_death), df_clinico$days_to_death, df_clinico$days_to_last)
+df_clinico$status <- ifelse(!is.na(df_clinico$vital_status) & (df_clinico$vital_status == "dead" | df_clinico$vital_status == "1"), 1, 0)
+
+# Filtramos filas que no tengan seguimiento clínico válido (tiempos NA, ceros o negativos)
+df_clinico <- df_clinico[!is.na(df_clinico$time) & df_clinico$time > 0, ]
+
+
+# 7. Recuperar los datos del cálculo de balance/ratio de la isoforma p01 de tu Bloque 15
+total_tumor <- as.numeric(fila_a_t) + as.numeric(fila_b_t)
+total_tumor[total_tumor == 0] <- NA
+prop_p01_tumor <- (as.numeric(fila_a_t) / total_tumor) * 100
+
+df_expresion_dut <- data.frame(
+  paciente       = pacientes_final,
+  Porcentaje_p01 = prop_p01_tumor,
+  stringsAsFactors = FALSE
+)
+
+
+# 8. Cruzar (Merge) Datos Clínicos y Datos Moleculares de Expresión
+df_surv_final <- merge(df_expresion_dut, df_clinico, by = "paciente")
+
+
+# 9. APLICAR OPCIÓN B: ESTRATIFICACIÓN BIOLÓGICA POR DOMINANCIA (BALANCE RATIO)
+# Si p01 > 50% domina el fenotipo de tejido sano fisiológico en el gen.
+# Si p01 < 50% la isoforma aberrante p02 es la dominante dentro del tumor.
+df_surv_final$Grupo_DUT <- ifelse(df_surv_final$Porcentaje_p01 > 50, 
+                                  "Dominante p01 (Fisiológico)", 
+                                  "Dominante p02 (Tumoral)")
+
+df_surv_final$Grupo_DUT <- factor(df_surv_final$Grupo_DUT, 
+                                  levels = c("Dominante p01 (Fisiológico)", "Dominante p02 (Tumoral)"))
+
+
+# 10. Ajustar el análisis de supervivencia de Kaplan-Meier
+objeto_surv <- Surv(time = df_surv_final$time, event = df_surv_final$status)
+fit_km      <- survfit(objeto_surv ~ Grupo_DUT, data = df_surv_final)
+
+
+# 11. Graficar la curva con estética elegante coherente con el estilo 'flatly'
+
+p_km <- ggsurvplot(
+  fit_km,
+  data           = df_surv_final,
+  pval           = TRUE,     
+  pval.coord     = c(3750, 1),
+  conf.int       = FALSE,              
+  risk.table     = TRUE,               
+  risk.table.col = "strata",
+  palette        = c("#3498DB", "#E74C3C"), 
+  legend.labs    = c("DUT-M", "DUT-N"),
+  title          = "Supervivencia Kaplan-Meier según Dominancia de Isoformas de DUT",
+  subtitle       = "Estratificación basada en el balance ratio (DUT-M vs DUT-N) en el tumor",
+  xlab           = "Tiempo (Días)",
+  ylab           = "Probabilidad de Supervivencia",
+  size           = 1.2,                
+  xlim           = c(0, 4000),         
+  break.time.by  = 250,
+  ylim           = c(0.70, 1.00),
+  risk.table.fontsize = 3.5,           # Achica los números para que quepan perfectamente cada 250 días
+  tables.theme        = theme_cleantable(), # Quita líneas innecesarias en la tabla
+  
+  ggtheme        = theme_minimal(base_size = 14) + 
+                   theme(
+                     plot.title = element_text(face = "bold", size = 15),
+                     axis.title = element_text(face = "bold")
+                   )
+)
+p_km$table <- p_km$table + 
+  theme(
+    axis.text.y = element_text(face = "bold", color = c("#3498DB", "#E74C3C")),
+    axis.title.y = element_blank()
+  )
+# Imprimir el gráfico resultante en el reporte RMarkdown
+print(p_km)
+
+```
+
+
